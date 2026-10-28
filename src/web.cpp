@@ -3,18 +3,26 @@
 //   GET  /                 the page
 //   GET  /api/slots        used slots as JSON (see slotsExport()); ?download=1 saves it as a file
 //   POST /api/slots        import: replaces every slot with the JSON body
-//   POST /api/slot         saves one slot from form fields n, label and link; an empty link clears it
+//   POST /api/slot         saves one slot from form fields n, label, link and metadata (see Slot); an
+//                          empty link clears it
+//   POST /api/move?from=6&to=12  moves a slot, swapping the two if the other one is used
 //   POST /api/play?n=12    plays a slot
+//   GET  /api/favorites    the household's Sonos Favorites: {"items": [{title, link, metadata, kind}]}
 //
 // Changes answer with the new slot list, errors with a plain-text message.
 
 #include "web.h"
 
+#include <ArduinoJson.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
 
+#include <vector>
+
 #include "config.h"
+#include "share_link.h"
 #include "slots.h"
+#include "sonos.h"
 
 static WebServer server(80);
 
@@ -45,15 +53,32 @@ button.save{background:var(--accent);border-color:var(--accent);color:#fff}
 #list{background:var(--card);border:1px solid var(--line);border-radius:12px}
 .row{display:grid;grid-template-columns:40px minmax(0,1fr) minmax(0,1.6fr) 150px auto;gap:8px;align-items:center;padding:8px 12px;border-top:1px solid var(--line)}
 .row:first-child{border-top:0}
-.num{font:600 16px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted)}
+button.num{font:600 16px ui-monospace,SFMono-Regular,Menlo,monospace;color:var(--muted);border:0;background:none;padding:0;text-align:left}
+button.num:disabled{opacity:1}
 .used .num{color:var(--accent)}
+.used .num:hover{text-decoration:underline}
 input[type=text]{width:100%;font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:8px;background:var(--field);color:var(--text)}
 input[type=text]:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .kind{font-size:13px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .kind.ok{color:var(--ok)}
 .kind.err{color:var(--err);white-space:normal}
-.acts{display:flex;gap:6px}
+.acts,.linkbox{display:flex;gap:6px}
 .only-used .row:not(.used){display:none}
+dialog{border:1px solid var(--line);border-radius:12px;background:var(--card);color:var(--text);padding:0;width:min(560px,calc(100vw - 32px));max-height:min(640px,calc(100vh - 32px))}
+dialog::backdrop{background:rgba(0,0,0,.45)}
+dialog[open]{display:flex;flex-direction:column}
+dialog header{display:flex;align-items:center;padding:12px 14px;border-bottom:1px solid var(--line)}
+dialog h2{font-size:16px;margin:0;flex:1}
+#favSearch{margin:10px 14px 6px;width:calc(100% - 28px)}
+#favList{overflow:auto;padding-bottom:8px}
+.fav{display:flex;gap:12px;justify-content:space-between;width:100%;text-align:left;border:0;border-radius:0;background:none;padding:9px 14px;white-space:normal}
+.fav:hover,.fav:focus{background:var(--field);outline:none}
+.fav span:last-child{color:var(--muted);font-size:13px;white-space:nowrap}
+#favList p{margin:0;padding:12px 14px;color:var(--muted)}
+#moveGrid{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:6px;padding:14px 14px 8px}
+#moveGrid button{padding:6px 0;font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace}
+#moveGrid button.used{background:var(--field);color:var(--muted);border-style:dashed}
+#moveHint{margin:0;padding:0 14px 14px;color:var(--muted);font-size:13px}
 @media (max-width:720px){.row{grid-template-columns:32px minmax(0,1fr)}.row>:nth-child(n+3){grid-column:2}}
 </style>
 </head>
@@ -61,7 +86,8 @@ input[type=text]:focus{outline:2px solid var(--accent);outline-offset:-1px}
 <main>
 <h1>Remote slots</h1>
 <p class="sub">Type two digits on the remote (00 to 99) to play a slot in {{ROOM}}. Each slot takes a Spotify or
-Apple Music album, playlist or track link, from Share &gt; Copy link in their apps.</p>
+Apple Music album, playlist or track link (Share &gt; Copy link in their apps), or one of your Sonos Favorites
+(&#9733;), stations included. Click a slot's number to move it.</p>
 <div class="bar">
 <label><input type="checkbox" id="onlyUsed"> Only used slots</label>
 <span class="grow"></span>
@@ -72,11 +98,25 @@ Apple Music album, playlist or track link, from Share &gt; Copy link in their ap
 <p id="note"></p>
 <div id="list"></div>
 </main>
+<dialog id="picker">
+<header><h2>Sonos Favorites</h2><button id="favClose" aria-label="Close">&times;</button></header>
+<input type="text" id="favSearch" placeholder="Search" aria-label="Search favorites">
+<div id="favList"></div>
+</dialog>
+<dialog id="mover">
+<header><h2 id="moveTitle">Move</h2><button id="moveClose" aria-label="Close">&times;</button></header>
+<div id="moveGrid"></div>
+<p id="moveHint">Pick a free slot (solid), or a used one (dashed) to swap the two.</p>
+</dialog>
 <script>
 const $ = (sel, el = document) => el.querySelector(sel);
 const list = $("#list"), note = $("#note"), onlyUsed = $("#onlyUsed");
+const picker = $("#picker"), favList = $("#favList"), favSearch = $("#favSearch");
+const mover = $("#mover"), moveGrid = $("#moveGrid");
 const pad = n => String(n).padStart(2, "0");
-let saved = {};  // Slot number -> {label, link, kind}, as saved on the board.
+let saved = {};          // Slot number -> {label, link, metadata, kind}, as saved on the board.
+const metadata = {};     // Slot number -> Sonos metadata for the row's link, for items from Sonos.
+let favorites = null, pickFor = -1, moveFrom = -1;
 
 function setNote(text, err) { note.textContent = text; note.className = err ? "err" : ""; }
 function setStatus(n, text, cls) {
@@ -100,16 +140,25 @@ function show(json, rows) {
     const row = $("#r" + n), s = saved[n] || {label: "", link: "", kind: ""};
     $(".label", row).value = s.label;
     $(".link", row).value = s.link;
+    metadata[n] = s.metadata || "";
     row.classList.toggle("used", !!s.link);
     $(".save", row).disabled = true;
-    $(".play", row).disabled = $(".clear", row).disabled = !s.link;
+    $(".num", row).disabled = $(".play", row).disabled = $(".clear", row).disabled = !s.link;
     setStatus(n, s.kind);
   }
 }
 
+// Enables Save while a row differs from what's saved.
+function edited(n) {
+  const row = $("#r" + n), s = saved[n] || {};
+  const label = $(".label", row).value, link = $(".link", row).value;
+  $(".save", row).disabled = label === (s.label || "") && link === (s.link || "") && metadata[n] === (s.metadata || "");
+  $(".play", row).disabled = !link.trim();
+}
+
 async function save(n) {
   const row = $("#r" + n);
-  const body = new URLSearchParams({n, label: $(".label", row).value, link: $(".link", row).value});
+  const body = new URLSearchParams({n, label: $(".label", row).value, link: $(".link", row).value, metadata: metadata[n]});
   try {
     show(await call("/api/slot", {method: "POST", body}), [n]);
     setStatus(n, saved[n] ? "Saved: " + saved[n].kind : "Cleared", "ok");
@@ -132,8 +181,81 @@ async function play(n) {
 function clear(n) {
   if (!confirm("Clear slot " + pad(n) + "?")) return;
   const row = $("#r" + n);
-  $(".label", row).value = $(".link", row).value = "";
+  $(".label", row).value = $(".link", row).value = metadata[n] = "";
   save(n);
+}
+
+async function openPicker(n) {
+  pickFor = n;
+  favSearch.value = "";
+  picker.showModal();
+  if (!favorites) {
+    showFavorites("Loading favorites from Sonos\u2026");
+    try {
+      favorites = JSON.parse(await call("/api/favorites")).items;
+    } catch (e) {
+      return showFavorites(e.message);
+    }
+  }
+  showFavorites();
+}
+
+// Lists the favorites matching the search, or shows a message instead.
+function showFavorites(message) {
+  const q = favSearch.value.trim().toLowerCase();
+  const shown = message ? [] : favorites.filter(f => (f.title + " " + f.kind).toLowerCase().includes(q));
+  favList.replaceChildren();
+  for (const f of shown) {
+    const b = document.createElement("button"), title = document.createElement("span"), kind = document.createElement("span");
+    b.className = "fav";
+    title.textContent = f.title;
+    kind.textContent = f.kind;
+    b.append(title, kind);
+    b.onclick = () => pick(f);
+    favList.append(b);
+  }
+  if (!shown.length) {
+    const p = document.createElement("p");
+    p.textContent = message || (favorites.length ? "No matches" : "No favorites that can be played");
+    favList.append(p);
+  }
+}
+
+async function openMover(n) {
+  if (!$("#r" + n + " .save").disabled && !await save(n)) return;
+  if (!saved[n]) return;
+  moveFrom = n;
+  $("#moveTitle").textContent = "Move " + pad(n) + ": " + (saved[n].label || saved[n].kind);
+  [...moveGrid.children].forEach((b, i) => {
+    const s = saved[i];
+    b.disabled = i === n;
+    b.className = s ? "used" : "";
+    b.title = i === n ? "" : s ? "Swap with " + pad(i) + ": " + (s.label || s.kind) : "Move to " + pad(i);
+  });
+  mover.showModal();
+}
+
+async function move(to) {
+  const from = moveFrom;
+  mover.close();
+  try {
+    show(await call("/api/move?from=" + from + "&to=" + to, {method: "POST"}), [from, to]);
+    setStatus(to, "Moved from " + pad(from), "ok");
+    setStatus(from, saved[from] ? "Swapped with " + pad(to) : "Moved to " + pad(to), "ok");
+    $("#r" + to).scrollIntoView({block: "center", behavior: "smooth"});
+  } catch (e) {
+    setStatus(from, e.message, "err");
+  }
+}
+
+function pick(f) {
+  const row = $("#r" + pickFor);
+  $(".label", row).value = f.title;
+  $(".link", row).value = f.link;
+  metadata[pickFor] = f.metadata || "";
+  edited(pickFor);
+  setStatus(pickFor, f.kind + ", not saved yet");
+  picker.close();
 }
 
 // Fills in an empty label with the album, playlist or song name from Spotify or Apple.
@@ -165,19 +287,23 @@ for (let n = 0; n < 100; n++) {
   const row = document.createElement("div");
   row.className = "row";
   row.id = "r" + n;
-  row.innerHTML = '<span class="num">' + pad(n) + '</span>' +
+  row.innerHTML = '<button class="num" disabled title="Move slot ' + pad(n) + '">' + pad(n) + '</button>' +
     '<input type="text" class="label" placeholder="Label" maxlength="80" aria-label="Label for slot ' + pad(n) + '">' +
-    '<input type="text" class="link" placeholder="Spotify or Apple Music link" aria-label="Link for slot ' + pad(n) + '">' +
+    '<span class="linkbox"><input type="text" class="link" placeholder="Spotify or Apple Music link" aria-label="Link for slot ' +
+    pad(n) + '"><button class="pick" title="Choose from Sonos Favorites" aria-label="Choose from Sonos Favorites for slot ' +
+    pad(n) + '">&#9733;</button></span>' +
     '<span class="kind"></span><span class="acts"><button class="save" disabled>Save</button>' +
     '<button class="play" disabled>Play</button><button class="clear" disabled>Clear</button></span>';
   list.append(row);
   const label = $(".label", row), link = $(".link", row);
-  label.oninput = link.oninput = () => {
-    const s = saved[n] || {};
-    $(".save", row).disabled = label.value === (s.label || "") && link.value === (s.link || "");
-    $(".play", row).disabled = !link.value.trim();
+  label.oninput = () => edited(n);
+  link.oninput = () => {
+    metadata[n] = "";  // A typed link is a share link.
+    edited(n);
   };
   link.onchange = () => autoLabel(n);
+  $(".pick", row).onclick = () => openPicker(n);
+  $(".num", row).onclick = () => openMover(n);
   row.onkeydown = e => { if (e.key === "Enter" && e.target.tagName === "INPUT") save(n); };
   $(".save", row).onclick = () => save(n);
   $(".play", row).onclick = () => play(n);
@@ -190,6 +316,18 @@ onlyUsed.onchange = () => {
 };
 try { onlyUsed.checked = localStorage.onlyUsed === "1"; } catch (e) {}
 onlyUsed.onchange();
+
+for (let n = 0; n < 100; n++) {
+  const b = document.createElement("button");
+  b.textContent = pad(n);
+  b.onclick = () => move(n);
+  moveGrid.append(b);
+}
+$("#moveClose").onclick = () => mover.close();
+
+favSearch.oninput = () => showFavorites();
+favSearch.onkeydown = e => { if (e.key === "Enter" && $(".fav", favList)) $(".fav", favList).click(); };
+$("#favClose").onclick = () => picker.close();
 
 $("#importBtn").onclick = () => $("#importFile").click();
 $("#importFile").onchange = async e => {
@@ -223,9 +361,9 @@ static String htmlEscape(const char *s) {
   return out;
 }
 
-// The "n" argument as a slot number, or -1.
-static int slotArg() {
-  String s = server.arg("n");
+// An argument as a slot number, or -1.
+static int slotArg(const char *name = "n") {
+  String s = server.arg(name);
   if (s.isEmpty() || s.length() > 2) return -1;
   for (char c : s)
     if (!isdigit((unsigned char)c)) return -1;
@@ -257,7 +395,11 @@ void webBegin() {
   });
   server.on("/api/slot", HTTP_POST, [] {
     String error;
-    sendSlotsOr(slotsSet(slotArg(), {server.arg("label"), server.arg("link")}, error), error);
+    sendSlotsOr(slotsSet(slotArg(), {server.arg("label"), server.arg("link"), server.arg("metadata")}, error), error);
+  });
+  server.on("/api/move", HTTP_POST, [] {
+    String error;
+    sendSlotsOr(slotsMove(slotArg("from"), slotArg("to"), error), error);
   });
   server.on("/api/play", HTTP_POST, [] {
     String name;
@@ -265,6 +407,24 @@ void webBegin() {
     if (n < 0) return server.send(400, "text/plain", "Slot numbers go from 0 to 99");
     bool ok = slotsPlay(n, name);
     server.send(ok ? 200 : 404, "text/plain", name);
+  });
+  server.on("/api/favorites", HTTP_GET, [] {
+    std::vector<SonosItem> items;
+    if (!sonosFavorites(items)) return server.send(503, "text/plain", "Couldn't get the favorites from Sonos");
+    JsonDocument doc;
+    JsonArray list = doc["items"].to<JsonArray>();
+    for (const SonosItem &item : items) {
+      JsonObject o = list.add<JsonObject>();
+      ShareLink share;
+      o["title"] = item.title;
+      o["link"] = item.link;
+      if (item.metadata.length()) o["metadata"] = item.metadata;
+      o["kind"] = item.metadata.length() ? sonosDescribeItem(item.metadata)
+                  : parseShareLink(item.link, share) ? describeShareLink(share) : String();
+    }
+    String json;
+    serializeJson(doc, json);
+    server.send(200, "application/json", json);
   });
   server.onNotFound([] { server.send(404, "text/plain", "Not found"); });
   server.begin();

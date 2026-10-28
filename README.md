@@ -7,9 +7,11 @@ remote can be swapped; see [Hardware configurations](#hardware-configurations).
 - Shows the title, artist and album, scrolling long lines, plus a play/pause icon and a progress bar
 - Follows grouping: finds the room's group coordinator and re-checks it every minute
 - Handles radio streams, TV (home theater) and line-in sources
-- IR remote: play/pause, next, previous, volume up/down (held to repeat), mute
-- Remote slots: typing two digits (00-99) on the remote plays a Spotify or Apple Music album,
-  playlist or track, set up from a web page on the board (http://sonos-display.local by default)
+- IR remote: play/pause, next, previous, volume up/down (held to repeat), mute, and saving what's
+  playing to a slot
+- Remote slots: typing two digits (00-99) on the remote plays an album, playlist, track or station,
+  set up from a web page on the board (http://sonos-display.local by default) with Spotify or Apple
+  Music links or your Sonos Favorites, or saved from what's playing with a button
 - Turns the screen off after 10 minutes without playback to avoid OLED burn-in
 
 It talks to the speakers directly over the local network (SSDP discovery and Sonos' UPnP/SOAP
@@ -109,16 +111,30 @@ action.
 Set up the slots from a computer or phone on the same network at **http://sonos-display.local**,
 or the name set with `SONOS_HOSTNAME` in `include/secrets.h` (give each board its own, such as
 `sonos-kitchen`, to run several). The board's IP address also works; it's shown on screen when the
-board connects to WiFi and logged to the serial monitor. For each slot, paste a share link from the
-Spotify or Apple Music app (Share > Copy link):
+board connects to WiFi and logged to the serial monitor. A slot can hold:
 
-- Spotify: albums, playlists, tracks, podcast shows and episodes (`https://open.spotify.com/...`).
-  Artist pages and `spotify.link` short links aren't supported.
-- Apple Music: albums, playlists and songs (`https://music.apple.com/...`).
+- A share link from the Spotify or Apple Music app (Share > Copy link). The page fills in an empty
+  label with the album, playlist or song name.
+  - Spotify: albums, playlists, tracks, podcast shows and episodes (`https://open.spotify.com/...`).
+    Artist pages and `spotify.link` short links aren't supported.
+  - Apple Music: albums, playlists and songs (`https://music.apple.com/...`), and albums and
+    playlists in your library (`https://music.apple.com/library/...`).
+- One of your Sonos Favorites, picked with the star button next to the link: albums, playlists,
+  tracks and stations from any service. Spotify and Apple Music ones become share links; others are
+  kept as Sonos had them.
 
-The service has to be added to your Sonos system. The page fills in an empty label with the album,
-playlist or song name. Playing a slot replaces the room's queue, as "Play Now" does in the Sonos app,
-on the whole group if the room is grouped.
+The service has to be added to your Sonos system. Playing an album or playlist replaces the room's
+queue, as "Play Now" does in the Sonos app, on the whole group if the room is grouped. Sonos'
+"Recently Played" isn't offered because speakers don't share it on the local network; it lives in
+Sonos' cloud.
+
+A button set to `Command::SaveToSlot` (0x44 on the default remote, which used to be mute) saves
+what's playing to the first empty slot and shows "Saved 05: ...", or "Already in 05: ..." when a slot
+has it. For music played from the queue that's the album or playlist it was started from; otherwise
+it's the station itself. This covers whatever was started from the Sonos app or a slot, from any
+service. TV, line-in and music started from another app such as Spotify (Spotify Connect or AirPlay)
+show "Can't save this", because Sonos doesn't know what those are. The board finds out what's playing
+by briefly subscribing to the speaker's events, which arrive on port 3500.
 
 Slots are saved in the board's flash, so they survive firmware uploads but stay with the board. Use
 **Export** on the page to save them as a JSON file and **Import** to load them onto another board.

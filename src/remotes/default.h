@@ -10,7 +10,7 @@ static const IrButton IR_BUTTONS[] = {
     {NEC, 0x00, 0x07, Command::Previous, false},
     {NEC, 0x00, 0x40, Command::VolumeUp, true},
     {NEC, 0x00, 0x19, Command::VolumeDown, true},
-    {NEC, 0x00, 0x44, Command::Mute, false},
+    {NEC, 0x00, 0x44, Command::SaveToSlot, false},
 
     // Digits: typing two plays that slot (00-99) from the web page.
     {NEC, 0x00, 0x16, Digit(0), false},

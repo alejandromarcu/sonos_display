@@ -30,6 +30,19 @@ static bool allDigits(const String &s) {
   return s.length() > 0;
 }
 
+// Library items: music.apple.com/library/albums/l.<id> or music.apple.com/library/playlist/p.<id>.
+static bool parseAppleLibrary(const String &path, ShareLink &out) {
+  String id = path.substring(path.lastIndexOf('/') + 1);
+  if (path == "library/albums/" + id) out.type = "libraryalbum";
+  else if (path == "library/playlist/" + id) out.type = "libraryplaylist";
+  else return false;
+  bool valid = id.length() > 2 && id[0] == (out.type == "libraryalbum" ? 'l' : 'p') && id[1] == '.';
+  for (int i = 2; i < (int)id.length(); i++) valid = valid && (isWordChar(id[i]) || id[i] == '-');
+  out.service = MusicService::AppleMusic;
+  out.id = out.type + ":" + id;
+  return valid;
+}
+
 // music.apple.com/<country>/album/<name>/<id> (with ?i=<song id> for one song on it),
 // music.apple.com/<country>/song/<name>/<id> or music.apple.com/<country>/playlist/<name>/pl.<id>.
 // The <name> part may be missing.
@@ -42,6 +55,7 @@ static bool parseAppleMusic(const String &link, ShareLink &out) {
   while (pathEnd < (int)link.length() && link[pathEnd] != '?' && link[pathEnd] != '#') pathEnd++;
   String path = link.substring(pathStart, pathEnd);
   if (path.endsWith("/")) path.remove(path.length() - 1);
+  if (path.startsWith("library/")) return parseAppleLibrary(path, out);
 
   int typeStart = path.indexOf('/') + 1;  // After the country code.
   int typeEnd = typeStart > 0 ? path.indexOf('/', typeStart) : -1;
@@ -79,5 +93,7 @@ bool parseShareLink(const String &link, ShareLink &out) {
 }
 
 String describeShareLink(const ShareLink &share) {
-  return String(share.service == MusicService::Spotify ? "Spotify " : "Apple Music ") + share.type;
+  String type = share.type;
+  if (type.startsWith("library")) type = "library " + type.substring(7);  // "libraryalbum"
+  return String(share.service == MusicService::Spotify ? "Spotify " : "Apple Music ") + type;
 }

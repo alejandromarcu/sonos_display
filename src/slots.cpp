@@ -13,11 +13,12 @@
 
 static const char *const SLOTS_FILE = "/slots.json";
 static const unsigned MAX_LABEL = 200, MAX_LINK = 400;  // Bytes; the page limits labels to 80 characters.
+static const unsigned MAX_METADATA = 4096;
 
 static Slot slots[SLOT_COUNT];  // Only used from the Arduino loop task (remote and web page).
 static bool mounted = false;
 
-// Tidies a slot from the web page or a file and checks that its link is one we can play.
+// Tidies a slot from the web page or a file and checks that it's something we can play.
 static bool clean(Slot &slot, String &error) {
   slot.label.trim();
   slot.link.trim();
@@ -36,11 +37,29 @@ static bool clean(Slot &slot, String &error) {
     return false;
   }
   ShareLink share;
-  if (slot.link.length() && (slot.link.length() > MAX_LINK || !parseShareLink(slot.link, share))) {
+  bool shareLink = parseShareLink(slot.link, share);
+  if (shareLink || slot.link.isEmpty()) slot.metadata = "";
+  bool sonosItem = slot.metadata.startsWith("<DIDL-Lite") && slot.metadata.length() <= MAX_METADATA;
+  if (slot.link.length() && (slot.link.length() > MAX_LINK || !(shareLink || sonosItem))) {
     error = "Not a Spotify or Apple Music album, playlist or track link";
     return false;
   }
   return true;
+}
+
+// "Spotify album", "Spotify station", ...
+static String kind(const Slot &slot) {
+  ShareLink share;
+  if (slot.metadata.length()) return sonosDescribeItem(slot.metadata);
+  return parseShareLink(slot.link, share) ? describeShareLink(share) : String();
+}
+
+// What a link plays, ignoring details such as a share link's "?si=" or a Sonos URI's account flags.
+static String identity(const String &link) {
+  ShareLink share;
+  if (parseShareLink(link, share)) return share.id;
+  int query = link.indexOf('?');
+  return query < 0 ? link : link.substring(0, query);
 }
 
 // Reads JSON in slotsExport()'s format into `out`, which gets SLOT_COUNT entries.
@@ -62,7 +81,7 @@ static bool parse(const String &json, std::vector<Slot> &out, String &error) {
       error = "Slot numbers go from 0 to 99";
       return false;
     }
-    Slot slot{o["label"] | "", o["link"] | ""};
+    Slot slot{o["label"] | "", o["link"] | "", o["metadata"] | ""};
     if (!clean(slot, error)) {
       error = "Slot " + String(n) + ": " + error;
       return false;
@@ -119,21 +138,56 @@ bool slotsSet(int n, Slot slot, String &error) {
   return false;
 }
 
-bool slotsPlay(int n, String &name) {
+bool slotsMove(int from, int to, String &error) {
+  if (from < 0 || from >= SLOT_COUNT || to < 0 || to >= SLOT_COUNT) {
+    error = "Slot numbers go from 0 to 99";
+    return false;
+  }
+  std::swap(slots[from], slots[to]);
+  if (save(error)) return true;
+  std::swap(slots[from], slots[to]);
+  return false;
+}
+
+// "12: Abbey Road", or "12: Spotify album" without a label, or "12: empty".
+static String slotName(int n) {
   char num[12];
-  snprintf(num, sizeof num, "%02d", n);
+  snprintf(num, sizeof num, "%02d: ", n);
+  const Slot &slot = slots[n];
+  if (slot.label.length()) return num + slot.label;
+  return num + (slot.link.length() ? kind(slot) : String("empty"));
+}
+
+bool slotsPlay(int n, String &name) {
   bool used = n >= 0 && n < SLOT_COUNT && slots[n].link.length();
   if (used) {
-    const Slot &slot = slots[n];
-    ShareLink share;
-    parseShareLink(slot.link, share);
-    name = String(num) + ": " + (slot.label.length() ? slot.label : describeShareLink(share));
-    sonosPlayLink(slot.link, name);
+    name = slotName(n);
+    sonosPlay(slots[n].link, slots[n].metadata, name);
   } else {
-    name = String(num) + ": empty";
+    char num[12];
+    snprintf(num, sizeof num, "%02d: empty", n);
+    name = num;
   }
   Serial.printf("Slot %s\n", name.c_str());
   return used;
+}
+
+bool slotsAdd(const String &link, const String &metadata, const String &label, String &message) {
+  int empty = -1;
+  for (int n = 0; n < SLOT_COUNT; n++) {
+    if (slots[n].link.isEmpty()) {
+      if (empty < 0) empty = n;
+    } else if (identity(slots[n].link) == identity(link)) {
+      message = "Already in " + slotName(n);
+      Serial.println(message);
+      return false;
+    }
+  }
+  String error;
+  bool saved = empty >= 0 && slotsSet(empty, {label, link, metadata}, error);
+  message = saved ? "Saved " + slotName(empty) : empty < 0 ? String("No empty slot") : error;
+  Serial.println(message);
+  return saved;
 }
 
 String slotsExport() {
@@ -141,13 +195,12 @@ String slotsExport() {
   JsonArray list = doc["slots"].to<JsonArray>();
   for (int n = 0; n < SLOT_COUNT; n++) {
     if (slots[n].link.isEmpty()) continue;
-    ShareLink share;
-    parseShareLink(slots[n].link, share);
     JsonObject o = list.add<JsonObject>();
     o["n"] = n;
     o["label"] = slots[n].label;
     o["link"] = slots[n].link;
-    o["kind"] = describeShareLink(share);
+    if (slots[n].metadata.length()) o["metadata"] = slots[n].metadata;
+    o["kind"] = kind(slots[n]);
   }
   String json;
   serializeJsonPretty(doc, json);

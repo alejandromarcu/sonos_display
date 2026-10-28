@@ -52,6 +52,8 @@ void loop() {
   if (toast) showOverlay(msg, 2000);
   String feedback;
   bool pressed = irRemotePoll(feedback);
+  String link, metadata, title;
+  if (sonosTakeSource(link, metadata, title)) slotsAdd(link, metadata, title, feedback);  // Command::SaveToSlot
   if (feedback.length()) showOverlay(feedback, 3000);
 
   // Turn the screen off after a while without playback to avoid OLED burn-in.
