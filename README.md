@@ -8,6 +8,8 @@ remote can be swapped; see [Hardware configurations](#hardware-configurations).
 - Follows grouping: finds the room's group coordinator and re-checks it every minute
 - Handles radio streams, TV (home theater) and line-in sources
 - IR remote: play/pause, next, previous, volume up/down (held to repeat), mute
+- Remote slots: typing two digits (00-99) on the remote plays a Spotify or Apple Music album,
+  playlist or track, set up from a web page on the board (http://sonos-display.local by default)
 - Turns the screen off after 10 minutes without playback to avoid OLED burn-in
 
 It talks to the speakers directly over the local network (SSDP discovery and Sonos' UPnP/SOAP
@@ -42,8 +44,8 @@ Power the OLED and the IR receiver (a 38 kHz module such as the VS1838B) from 3.
    ```
 
    Then edit `include/secrets.h` with your WiFi network, the Sonos room name exactly as it appears in
-   the Sonos app, and optionally the IP of one of your speakers to skip discovery on boot. This file
-   is gitignored.
+   the Sonos app, optionally the IP of one of your speakers to skip discovery on boot, and the
+   board's network name (its web page address). This file is gitignored.
 3. Build, flash and watch the serial log:
 
    ```bash
@@ -83,6 +85,8 @@ Code layout:
 
 - `src/sonos.cpp`: discovery, polling and commands; the same for all hardware
 - `src/main.cpp`: connects the Sonos client to the display and remote, and handles the screen-off timer
+- `src/slots.cpp`, `src/web.cpp`, `src/share_link.cpp`: the remote slots, their web page, and
+  recognizing Spotify and Apple Music links
 - `src/displays/`: display drivers
 - `src/ir_remote.cpp`: IR receiver; `src/remotes/` has each remote's button table
 
@@ -93,7 +97,41 @@ table shows its protocol, address and command on screen and logs them to the ser
 (115200 baud). This means you can point any remote that IRremote decodes (NEC, Samsung, Sony, RC5,
 ...) at the receiver, note the codes and add them to the table.
 
+Digit buttons are listed in the table as `Digit(0)` to `Digit(9)`; see [Remote slots](#remote-slots).
+
+## Remote slots
+
+Typing two digits on the remote plays one of 100 slots, 00 to 99 (so slot 7 is "0", "7"). The first
+digit shows as "1_" on screen; the second starts the slot and shows its name, or "12: empty". A first
+digit is forgotten after 5 seconds, and pressing any other button cancels it and does that button's
+action.
+
+Set up the slots from a computer or phone on the same network at **http://sonos-display.local**,
+or the name set with `SONOS_HOSTNAME` in `include/secrets.h` (give each board its own, such as
+`sonos-kitchen`, to run several). The board's IP address also works; it's shown on screen when the
+board connects to WiFi and logged to the serial monitor. For each slot, paste a share link from the
+Spotify or Apple Music app (Share > Copy link):
+
+- Spotify: albums, playlists, tracks, podcast shows and episodes (`https://open.spotify.com/...`).
+  Artist pages and `spotify.link` short links aren't supported.
+- Apple Music: albums, playlists and songs (`https://music.apple.com/...`).
+
+The service has to be added to your Sonos system. The page fills in an empty label with the album,
+playlist or song name. Playing a slot replaces the room's queue, as "Play Now" does in the Sonos app,
+on the whole group if the room is grouped.
+
+Slots are saved in the board's flash, so they survive firmware uploads but stay with the board. Use
+**Export** on the page to save them as a JSON file and **Import** to load them onto another board.
+
+With several boards, keep in mind that each one obeys any remote in sight that sends its codes. Boards
+in different rooms are fine with the same remote model; for two within sight of each other, give one
+a remote with different codes (its own table in `src/remotes/`).
+
+Sonos accepts Spotify links with a region-specific account number (2311 in Europe, 3079 in the US).
+Both are tried and the one that works is remembered until the next restart, so the serial log may
+show one `AddURIToQueue -> error` the first time a Spotify slot plays.
+
 ## Configuration
 
-Settings that apply to every configuration, such as the poll interval, volume step and screen-off
-timeout, are in `src/config.h`.
+Settings that apply to every configuration, such as the poll interval, volume step, screen-off
+timeout, digit timeout and hostname, are in `src/config.h`.

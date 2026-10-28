@@ -23,6 +23,10 @@ void sonosStart();
 // Queues a command for the speaker. Its result arrives as a toast.
 void sonosSend(Command cmd);
 
+// Replaces the queue with a Spotify or Apple Music link (see share_link.h) and plays it. `name` is
+// shown as a toast once it starts ("12: Abbey Road").
+void sonosPlayLink(const String &link, const String &name);
+
 // Copies the latest state into `np`; returns true if it changed since the last call.
 bool sonosTakeState(NowPlaying &np);
 

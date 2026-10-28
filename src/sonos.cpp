@@ -12,15 +12,23 @@
 #include <vector>
 
 #include "config.h"
+#include "share_link.h"
 
 // ---- Shared state ----------------------------------------------------------
+
+// A queued remote command, or a request to play pendingLink.
+struct Request {
+  bool playLink;
+  Command cmd;
+};
 
 static SemaphoreHandle_t stateMutex;
 static NowPlaying sharedState;
 static uint32_t sharedVersion = 0;
 static String sharedToast;
 static uint32_t toastVersion = 0;
-static QueueHandle_t commandQueue;
+static String pendingLink, pendingName;  // Guarded by stateMutex, like the above.
+static QueueHandle_t commandQueue;       // Of Request.
 
 static void publish(const NowPlaying &np) {
   // Only the network task writes sharedState, so reading it here needs no lock.
@@ -49,7 +57,19 @@ static void publishStatus(const String &msg) {
   publish(np);
 }
 
-void sonosSend(Command cmd) { xQueueSend(commandQueue, &cmd, 0); }
+void sonosSend(Command cmd) {
+  Request req{false, cmd};
+  xQueueSend(commandQueue, &req, 0);
+}
+
+void sonosPlayLink(const String &link, const String &name) {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  pendingLink = link;
+  pendingName = name;
+  xSemaphoreGive(stateMutex);
+  Request req{true};
+  xQueueSend(commandQueue, &req, 0);
+}
 
 bool sonosTakeState(NowPlaying &np) {
   static uint32_t seen = UINT32_MAX;
@@ -123,6 +143,19 @@ static String xmlUnescape(const String &s) {
   return out;
 }
 
+static String xmlEscape(const String &s) {
+  String out;
+  out.reserve(s.length() + s.length() / 4);
+  for (char c : s) {
+    if (c == '&') out += "&amp;";
+    else if (c == '<') out += "&lt;";
+    else if (c == '>') out += "&gt;";
+    else if (c == '"') out += "&quot;";
+    else out += c;
+  }
+  return out;
+}
+
 // Text between <tag ...> and </tag>, or "" if absent or self-closing.
 static String tagContent(const String &xml, const String &tag) {
   String open = "<" + tag;
@@ -178,11 +211,11 @@ static uint32_t parseHms(const String &s) {
 // ---- Sonos UPnP ------------------------------------------------------------
 
 static bool soapCall(const String &ip, const char *path, const char *service, const char *action,
-                     const char *args, String &response) {
+                     const char *args, String &response, uint16_t timeoutMs = 4000) {
   WiFiClient client;
   HTTPClient http;
   http.setConnectTimeout(2000);
-  http.setTimeout(4000);
+  http.setTimeout(timeoutMs);
   if (!http.begin(client, ip, 1400, path)) return false;
 
   String urn = String("urn:schemas-upnp-org:service:") + service + ":1";
@@ -197,6 +230,8 @@ static bool soapCall(const String &ip, const char *path, const char *service, co
   int code = http.POST(body);
   bool ok = code == 200;
   if (ok) response = http.getString();
+  else if (code == 500)  // A UPnP fault; its errorCode says why.
+    Serial.printf("SOAP %s %s -> error %s\n", ip.c_str(), action, tagContent(http.getString(), "errorCode").c_str());
   else Serial.printf("SOAP %s %s -> %d\n", ip.c_str(), action, code);
   http.end();
   return ok;
@@ -228,9 +263,10 @@ static std::vector<String> discoverSonos() {
   return ips;
 }
 
-static String coordinatorIp;   // Group coordinator for ROOM_NAME; owned by the network task.
-static String knownSpeakerIp;  // Last speaker that answered a topology query.
-static String roomIp;          // The room's own (visible) speaker; volume and mute go here.
+static String coordinatorIp;    // Group coordinator for ROOM_NAME; owned by the network task.
+static String coordinatorUuid;  // Its "RINCON_..." id, which names its queue.
+static String knownSpeakerIp;   // Last speaker that answered a topology query.
+static String roomIp;           // The room's own (visible) speaker; volume and mute go here.
 
 static String hostFromLocation(const String &location) {  // "http://1.2.3.4:1400/..." -> "1.2.3.4"
   int hostStart = location.indexOf("://");
@@ -275,6 +311,7 @@ static bool findCoordinatorVia(const String &ip) {
 
     if (newIp != coordinatorIp) Serial.printf("Coordinator for %s: %s\n", ROOM_NAME, newIp.c_str());
     coordinatorIp = newIp;
+    coordinatorUuid = coordUuid;
     roomIp = memberIp;
     knownSpeakerIp = ip;
     return true;
@@ -386,6 +423,88 @@ static void runCommand(Command cmd, PlayState current) {
   if (!ok) publishToast("Command failed");
 }
 
+// How Sonos refers to each kind of shared item: the URI to queue, and the id prefix and class in
+// its metadata. From SoCo's share-link plugin (soco/plugins/sharelink.py).
+struct ShareMagic {
+  const char *type, *uriPrefix, *idPrefix, *upnpClass;
+};
+static const ShareMagic SHARE_MAGIC[] = {
+    {"album", "x-rincon-cpcontainer:1004206c", "00040000", "object.container.album.musicAlbum"},
+    {"playlist", "x-rincon-cpcontainer:1006206c", "1006206c", "object.container.playlistContainer"},
+    {"show", "x-rincon-cpcontainer:1006206c", "1006206c", "object.container.playlistContainer"},
+    {"track", "", "00032020", "object.item.audioItem.musicTrack"},
+    {"episode", "", "00032020", "object.item.audioItem.musicTrack"},
+    {"song", "", "10032020", "object.item.audioItem.musicTrack"},
+};
+
+// The number in each service's account token ("SA_RINCON2311_X_#Svc2311-0-Token"). Spotify's
+// depends on the region (2311 in Europe, 3079 in the US), so the speaker is offered each in turn
+// until it accepts one, which is then tried first.
+static std::vector<uint16_t> spotifyTokens = {2311, 3079};
+static std::vector<uint16_t> appleMusicTokens = {52231};
+
+// Replaces the queue with a share link's album, playlist or track and plays it from the start.
+static bool playShareLink(const String &link) {
+  ShareLink share;
+  const ShareMagic *magic = nullptr;
+  if (parseShareLink(link, share))
+    for (const ShareMagic &m : SHARE_MAGIC)
+      if (share.type == m.type) magic = &m;
+  if (!magic) {
+    Serial.printf("Can't play %s\n", link.c_str());
+    return false;
+  }
+  String id = share.id;
+  id.replace(":", "%3a");
+  String uri = magic->uriPrefix + id;
+
+  const char *av = "/MediaRenderer/AVTransport/Control";
+  const char *instance = "<InstanceID>0</InstanceID>";
+  String resp;
+  if (!soapCall(coordinatorIp, av, "AVTransport", "RemoveAllTracksFromQueue", instance, resp)) return false;
+
+  std::vector<uint16_t> &tokens = share.service == MusicService::Spotify ? spotifyTokens : appleMusicTokens;
+  bool added = false;
+  for (size_t i = 0; i < tokens.size() && !added; i++) {
+    String token = String(tokens[i]);
+    String didl = String(
+                      "<DIDL-Lite xmlns:dc=\"http://purl.org/dc/elements/1.1/\" "
+                      "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\" "
+                      "xmlns:r=\"urn:schemas-rinconnetworks-com:metadata-1-0/\" "
+                      "xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\"><item id=\"") +
+                  magic->idPrefix + id + "\" parentID=\"-1\" restricted=\"true\"><dc:title></dc:title><upnp:class>" +
+                  magic->upnpClass +
+                  "</upnp:class><desc id=\"cdudn\" nameSpace=\"urn:schemas-rinconnetworks-com:metadata-1-0/\">"
+                  "SA_RINCON" + token + "_X_#Svc" + token + "-0-Token</desc></item></DIDL-Lite>";
+    String args = String(instance) + "<EnqueuedURI>" + xmlEscape(uri) + "</EnqueuedURI><EnqueuedURIMetaData>" +
+                  xmlEscape(didl) +
+                  "</EnqueuedURIMetaData><DesiredFirstTrackNumberEnqueued>0</DesiredFirstTrackNumberEnqueued>"
+                  "<EnqueueAsNext>0</EnqueueAsNext>";
+    // Sonos looks the item up with the service, which can take a while for long playlists.
+    if (soapCall(coordinatorIp, av, "AVTransport", "AddURIToQueue", args.c_str(), resp, 15000)) {
+      added = true;
+      std::rotate(tokens.begin(), tokens.begin() + i, tokens.begin() + i + 1);
+    }
+  }
+  if (!added) return false;
+
+  String queue = String(instance) + "<CurrentURI>x-rincon-queue:" + coordinatorUuid +
+                 "#0</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>";
+  if (!soapCall(coordinatorIp, av, "AVTransport", "SetAVTransportURI", queue.c_str(), resp)) return false;
+  const char *firstTrack = "<InstanceID>0</InstanceID><Unit>TRACK_NR</Unit><Target>1</Target>";
+  soapCall(coordinatorIp, av, "AVTransport", "Seek", firstTrack, resp);  // Best effort: start at the first track.
+  return soapCall(coordinatorIp, av, "AVTransport", "Play", "<InstanceID>0</InstanceID><Speed>1</Speed>", resp);
+}
+
+static void playPendingLink() {
+  xSemaphoreTake(stateMutex, portMAX_DELAY);
+  String link = pendingLink, name = pendingName;
+  pendingLink = "";  // Several quick requests play only the latest link, once.
+  xSemaphoreGive(stateMutex);
+  if (link.isEmpty()) return;
+  publishToast(playShareLink(link) ? name : String("Play failed"));
+}
+
 static void networkTask(void *) {
   uint32_t lastTopologyMs = 0;
   uint32_t connectingSinceMs = millis();
@@ -400,8 +519,10 @@ static void networkTask(void *) {
         WiFi.reconnect();
       }
       vTaskDelay(pdMS_TO_TICKS(1000));
-      if (WiFi.status() == WL_CONNECTED)
-        Serial.printf("WiFi connected, IP %s\n", WiFi.localIP().toString().c_str());
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("WiFi connected, web page at http://%s.local\n", HOSTNAME);
+        publishToast("IP " + WiFi.localIP().toString());
+      }
       continue;
     }
     connectingSinceMs = millis();
@@ -429,19 +550,22 @@ static void networkTask(void *) {
     }
 
     // Wait for the next poll, waking early for remote commands (then polling right away to show the result).
-    Command cmd;
-    if (xQueueReceive(commandQueue, &cmd, pdMS_TO_TICKS(POLL_INTERVAL_MS)) == pdTRUE) {
-      do runCommand(cmd, np.state);
-      while (xQueueReceive(commandQueue, &cmd, 0) == pdTRUE);
+    Request req;
+    if (xQueueReceive(commandQueue, &req, pdMS_TO_TICKS(POLL_INTERVAL_MS)) == pdTRUE) {
+      do {
+        if (req.playLink) playPendingLink();
+        else runCommand(req.cmd, np.state);
+      } while (xQueueReceive(commandQueue, &req, 0) == pdTRUE);
     }
   }
 }
 
 void sonosStart() {
   stateMutex = xSemaphoreCreateMutex();
-  commandQueue = xQueueCreate(8, sizeof(Command));
+  commandQueue = xQueueCreate(8, sizeof(Request));
   publishStatus("Connecting to WiFi...");
 
+  WiFi.setHostname(HOSTNAME);
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
