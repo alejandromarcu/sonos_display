@@ -25,6 +25,7 @@ Each PlatformIO environment is one hardware configuration:
 |------------------------|--------------------------------|-------------------------|--------------------|
 | `freenove_s3_ssd1306`  | Freenove ESP32-S3-WROOM-1 N8R8 | SSD1306 128x64 I2C OLED | Cheap NEC remote   |
 | `freenove_s3_headless` | Freenove ESP32-S3-WROOM-1 N8R8 | None (serial log only)  | Cheap NEC remote   |
+| `atoms3_lite_headless` | M5Stack AtomS3 Lite + IR Unit  | None (serial log only)  | Cheap NEC remote   |
 
 Wiring on the Freenove board:
 
@@ -35,6 +36,9 @@ Wiring on the Freenove board:
 | IR receiver | 14            |
 
 Power the OLED and the IR receiver (a 38 kHz module such as the VS1838B) from 3.3 V.
+
+The AtomS3 Lite needs no wiring: plug the M5Stack IR Unit into its Grove port with the cable that
+comes with it (the receiver is on G1). The board's USB-C port is used for flashing and the serial log.
 
 ## Setup
 
