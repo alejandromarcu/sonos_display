@@ -7,7 +7,11 @@
 
 void irRemoteBegin();
 
-// Checks for a button press and sends known buttons' commands to the speaker. Returns true when a
-// button was pressed. A code that isn't in the remote's table is described in `unknown`
-// ("IR NEC 0:15") so it can be shown and added to the table.
-bool irRemotePoll(String &unknown);
+// Checks for a button press and acts on it: known buttons send their command to the speaker, and two
+// digit buttons in a row play that slot (see slots.h). Returns true when a button was pressed.
+// `message` is set to brief feedback to show: the slot being played ("12: Abbey Road" or
+// "12: empty"), or a code that isn't in the remote's table ("IR NEC 0:15") so it can be added.
+bool irRemotePoll(String &message);
+
+// The slot number being typed ("1_") while waiting for its second digit, or "" otherwise.
+String irRemoteTyping();

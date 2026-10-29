@@ -10,3 +10,7 @@
 
 // Optional IP of any Sonos speaker, tried before SSDP discovery. Leave "" to always discover.
 #define SONOS_SEED_IP ""
+
+// This board's name on the network: its web page is at http://<name>.local. Give each board its
+// own, such as "sonos-kitchen". Letters, digits and hyphens only.
+#define SONOS_HOSTNAME "sonos-display"
